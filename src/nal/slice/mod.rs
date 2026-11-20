@@ -1,5 +1,6 @@
 mod cavlc;
 pub mod data;
+pub mod fmo;
 pub mod macroblock;
 
 use crate::nal::pps;

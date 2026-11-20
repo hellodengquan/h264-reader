@@ -53,10 +53,24 @@ impl SliceGroupChangeType {
 
 #[derive(Debug, Clone)]
 pub struct SliceRect {
-    top_left: u32,
-    bottom_right: u32,
+    pub(crate) top_left: u32,
+    pub(crate) bottom_right: u32,
 }
 impl SliceRect {
+    /// Raster-scan map unit addresses of the rectangle's top-left and bottom-right
+    /// corners.
+    pub(crate) fn addrs(&self) -> (u32, u32) {
+        (self.top_left, self.bottom_right)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(top_left: u32, bottom_right: u32) -> SliceRect {
+        SliceRect {
+            top_left,
+            bottom_right,
+        }
+    }
+
     fn read<R: BitRead>(r: &mut R, sps: &SeqParameterSet) -> Result<SliceRect, PpsError> {
         let rect = SliceRect {
             top_left: r.read_ue("top_left")?,

@@ -8,6 +8,7 @@
 //!    decoder-computed `nC` values.
 
 pub use crate::nal::slice::cavlc::{CavlcContext, CavlcError};
+use crate::nal::slice::fmo::{SliceGroupMap, SliceGroupMapError};
 use crate::nal::slice::macroblock::{
     coded_block_pattern_from_me, i_mb_type_info, p_mb_type_info, p_sub_mb_type_info, IMbTypeInfo,
     MbPartPredMode, MbTypeError, PMbTypeInfo, SubMbTypeInfo,
@@ -23,7 +24,15 @@ pub enum SliceDataError {
     InvalidMbType(MbTypeError),
     InvalidSubMbType(MbTypeError),
     InvalidCodedBlockPattern(u32),
-    InvalidParameter { field: &'static str, value: i64 },
+    InvalidParameter {
+        field: &'static str,
+        value: i64,
+    },
+    /// The PPS slice-group declaration could not be turned into a map for this picture.
+    InvalidSliceGroup(SliceGroupMapError),
+    /// `first_mb_in_slice` names a map unit not present in the picture, or one that
+    /// cannot be located in its slice group.
+    InvalidFirstMbInSlice(u32),
 }
 
 impl fmt::Display for SliceDataError {
@@ -38,6 +47,10 @@ impl fmt::Display for SliceDataError {
             SliceDataError::InvalidParameter { field, value } => {
                 write!(f, "{field} out of range: {value}")
             }
+            SliceDataError::InvalidSliceGroup(e) => write!(f, "invalid slice group map: {e}"),
+            SliceDataError::InvalidFirstMbInSlice(v) => {
+                write!(f, "first_mb_in_slice {v} is not a valid map unit address")
+            }
         }
     }
 }
@@ -47,6 +60,12 @@ impl std::error::Error for SliceDataError {}
 impl From<BitReaderError> for SliceDataError {
     fn from(e: BitReaderError) -> Self {
         SliceDataError::BitReaderError(e)
+    }
+}
+
+impl From<SliceGroupMapError> for SliceDataError {
+    fn from(e: SliceGroupMapError) -> Self {
+        SliceDataError::InvalidSliceGroup(e)
     }
 }
 
@@ -121,8 +140,17 @@ pub enum SliceEvent<'a, R: BitRead> {
 struct SliceDataCore<'a, R: BitRead> {
     reader: &'a mut R,
     slice_family: SliceFamily,
+    /// Slice group this slice belongs to.
+    group: u8,
+    /// Position within the slice group's ascending map-unit address list.
+    group_index: usize,
+    /// Raster-scan map unit address of the macroblock currently being read.
     curr_mb_addr: u32,
-    pic_size_in_mbs: u32,
+    /// Number of map units in the slice group (the slice covers all of them).
+    group_len: usize,
+    /// The full per-picture slice group map, retained so callers can inspect group
+    /// assignments while iterating.
+    group_map: SliceGroupMap,
     num_ref_idx_l0_active_minus1: u32,
     pending_skips: u32,
     after_skip_run: bool,
@@ -130,8 +158,21 @@ struct SliceDataCore<'a, R: BitRead> {
 }
 
 impl<R: BitRead> SliceDataCore<'_, R> {
-    fn next_mb_address(&self, addr: u32) -> u32 {
-        addr + 1
+    /// Advance to the next map unit of this slice group, returning its raster-scan
+    /// address, or `None` when every map unit of the group has been visited.
+    fn advance_mb_address(&mut self) -> Option<u32> {
+        self.group_index += 1;
+        if self.group_index >= self.group_len {
+            self.done = true;
+            None
+        } else {
+            let addr = self
+                .group_map
+                .addr_in_group(self.group, self.group_index)
+                .expect("group_index is bounded by the group's address list length");
+            self.curr_mb_addr = addr;
+            Some(addr)
+        }
     }
 
     fn parse_macroblock_header(
@@ -496,25 +537,69 @@ pub struct SliceDataReader<'a, R: BitRead> {
 }
 
 impl<'a, R: BitRead> SliceDataReader<'a, R> {
+    /// Create a reader for a slice whose macroblocks are visited in plain raster order
+    /// (a single-slice-group PPS).
+    ///
+    /// Returns [`SliceDataError::InvalidFirstMbInSlice`] when `first_mb_in_slice` is not
+    /// a valid map unit address within `pic_size_in_mbs`. For PPSes that declare multiple
+    /// slice groups, build a [`crate::nal::slice::fmo::SliceGroupMap`] and use
+    /// [`Self::with_group_map()`] instead.
     pub fn new(
         reader: &'a mut R,
         slice_family: SliceFamily,
         first_mb_in_slice: u32,
         pic_size_in_mbs: u32,
         num_ref_idx_l0_active_minus1: u32,
-    ) -> Self {
-        SliceDataReader {
+    ) -> Result<Self, SliceDataError> {
+        let group_map = SliceGroupMap::single_group(pic_size_in_mbs);
+        Self::with_group_map(
+            reader,
+            slice_family,
+            first_mb_in_slice,
+            group_map,
+            num_ref_idx_l0_active_minus1,
+        )
+    }
+
+    /// Create a reader that walks macroblocks according to `group_map`, as required when
+    /// the active PPS declares more than one slice group.
+    ///
+    /// The map must describe the picture that the slice belongs to (rebuilt per picture
+    /// for map types 3–5 using `slice_group_change_cycle`). The reader locates
+    /// `first_mb_in_slice` inside its slice group and then visits that group's map units
+    /// in ascending raster-scan order, so the macroblocks of every slice in the picture
+    /// together cover each map unit exactly once.
+    pub fn with_group_map(
+        reader: &'a mut R,
+        slice_family: SliceFamily,
+        first_mb_in_slice: u32,
+        group_map: SliceGroupMap,
+        num_ref_idx_l0_active_minus1: u32,
+    ) -> Result<Self, SliceDataError> {
+        let (group, group_index) = group_map
+            .group_position(first_mb_in_slice)
+            .ok_or(SliceDataError::InvalidFirstMbInSlice(first_mb_in_slice))?;
+        let group_len = group_map.group_len(group);
+        Ok(SliceDataReader {
             core: SliceDataCore {
                 reader,
                 slice_family,
+                group,
+                group_index,
                 curr_mb_addr: first_mb_in_slice,
-                pic_size_in_mbs,
+                group_len,
+                group_map,
                 num_ref_idx_l0_active_minus1,
                 pending_skips: 0,
                 after_skip_run: false,
                 done: false,
             },
-        }
+        })
+    }
+
+    /// The slice group map in effect for this slice.
+    pub fn group_map(&self) -> &SliceGroupMap {
+        &self.core.group_map
     }
 
     pub fn next(mut self) -> Result<SliceEvent<'a, R>, SliceDataError> {
@@ -522,16 +607,15 @@ impl<'a, R: BitRead> SliceDataReader<'a, R> {
             return Ok(SliceEvent::End);
         }
 
-        if self.core.curr_mb_addr >= self.core.pic_size_in_mbs {
-            self.core.done = true;
-            return Ok(SliceEvent::End);
-        }
-
         if self.core.pending_skips > 0 {
             self.core.pending_skips -= 1;
             let addr = self.core.curr_mb_addr;
-            self.core.curr_mb_addr = self.core.next_mb_address(addr);
-            if self.core.pending_skips == 0 {
+            // A skip run that overruns the slice group is a malformed stream; stop at the
+            // group boundary rather than emitting an out-of-range address.
+            let group_exhausted = self.core.advance_mb_address().is_none();
+            if group_exhausted {
+                self.core.done = true;
+            } else if self.core.pending_skips == 0 {
                 if !self.core.reader.has_more_rbsp_data("slice_data")? {
                     self.core.done = true;
                 } else {
@@ -554,9 +638,9 @@ impl<'a, R: BitRead> SliceDataReader<'a, R> {
                 self.core.pending_skips = mb_skip_run;
                 self.core.pending_skips -= 1;
                 let addr = self.core.curr_mb_addr;
-                self.core.curr_mb_addr = self.core.next_mb_address(addr);
+                let group_exhausted = self.core.advance_mb_address().is_none();
                 if self.core.pending_skips == 0 {
-                    if !self.core.reader.has_more_rbsp_data("slice_data")? {
+                    if group_exhausted || !self.core.reader.has_more_rbsp_data("slice_data")? {
                         self.core.done = true;
                     } else {
                         self.core.after_skip_run = true;
@@ -575,7 +659,9 @@ impl<'a, R: BitRead> SliceDataReader<'a, R> {
 
         let mb_addr = self.core.curr_mb_addr;
         let header = self.core.parse_macroblock_header(mb_addr)?;
-        self.core.curr_mb_addr = self.core.next_mb_address(mb_addr);
+        // The group is exhausted once there is no further map unit to visit; the caller
+        // still gets the parsed macroblock via `MacroblockResidual`.
+        self.core.advance_mb_address();
 
         Ok(SliceEvent::Macroblock(MacroblockResidual {
             core: self.core,
@@ -588,7 +674,7 @@ impl<'a, R: BitRead> SliceDataReader<'a, R> {
     }
 
     pub fn pic_size_in_mbs(&self) -> u32 {
-        self.core.pic_size_in_mbs
+        self.core.group_map.pic_size_in_map_units()
     }
 }
 
@@ -635,5 +721,209 @@ impl<'a, R: BitRead> MacroblockResidual<'a, R> {
             }
         }
         Ok(SliceDataReader { core: self.core })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nal::pps::SliceGroup;
+    use crate::nal::rbsp::{BitReader, BitWrite, BitWriter};
+    use crate::nal::sps::{
+        ChromaFormat, ChromaInfo, ConstraintFlags, FrameMbsFlags, PicOrderCntType, Profile,
+        ProfileIdc, SeqParamSetId, SeqParameterSet,
+    };
+    use std::io::Cursor;
+
+    fn sps(width_mbs: u32, height_mbs: u32) -> SeqParameterSet {
+        SeqParameterSet {
+            profile_idc: ProfileIdc::from(Profile::Baseline.profile_idc()),
+            constraint_flags: ConstraintFlags::from(0),
+            level_idc: 30,
+            seq_parameter_set_id: SeqParamSetId::from_u32(0).unwrap(),
+            chroma_info: ChromaInfo {
+                chroma_format: ChromaFormat::YUV420,
+                ..ChromaInfo::default()
+            },
+            log2_max_frame_num_minus4: 0,
+            pic_order_cnt: PicOrderCntType::TypeTwo,
+            max_num_ref_frames: 1,
+            gaps_in_frame_num_value_allowed_flag: false,
+            pic_width_in_mbs_minus1: width_mbs - 1,
+            pic_height_in_map_units_minus1: height_mbs - 1,
+            frame_mbs_flags: FrameMbsFlags::Frames,
+            direct_8x8_inference_flag: true,
+            frame_cropping: None,
+            vui_parameters: None,
+        }
+    }
+
+    /// Build an RBSP byte vector containing the Exp-Golomb `mb_skip_run` value followed
+    /// by RBSP trailing bits.
+    fn skip_run_rbsp(skip_run: u32) -> Vec<u8> {
+        let mut w = BitWriter::new(Vec::new());
+        w.write_ue(skip_run).unwrap();
+        w.write_rbsp_trailing_bits().unwrap();
+        w.into_writer()
+    }
+
+    /// Drive a P-slice reader over a stream of pure skip macroblocks and return the
+    /// raster-scan addresses it emitted.
+    fn read_skip_addresses(group_map: SliceGroupMap, first_mb: u32, skip_run: u32) -> Vec<u32> {
+        let rbsp = skip_run_rbsp(skip_run);
+        // A leading zero byte stands in for the NAL header skipped by ByteReader.
+        let mut nal = vec![0u8];
+        nal.extend_from_slice(&rbsp);
+        let mut reader = BitReader::new(crate::rbsp::ByteReader::skipping_h264_header(
+            Cursor::new(nal),
+        ));
+        let data = match SliceDataReader::with_group_map(
+            &mut reader,
+            SliceFamily::P,
+            first_mb,
+            group_map,
+            0,
+        ) {
+            Ok(d) => d,
+            Err(e) => panic!("with_group_map failed: {}", e),
+        };
+        let mut addrs = Vec::new();
+        let mut data = data;
+        loop {
+            match data.next().unwrap() {
+                SliceEvent::End => break,
+                SliceEvent::Skip { mb_addr, next } => {
+                    addrs.push(mb_addr);
+                    data = next;
+                }
+                SliceEvent::Macroblock(_) => panic!("unexpected coded macroblock"),
+            }
+        }
+        addrs
+    }
+
+    #[test]
+    fn single_group_keeps_raster_order() {
+        let s = sps(4, 4);
+        let map = SliceGroupMap::for_picture(&s, None, None).unwrap();
+        let addrs = read_skip_addresses(map, 0, 16);
+        assert_eq!(addrs, (0..16).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn explicit_slice_groups_address_actual_positions() {
+        let s = sps(4, 4);
+        // Even map units go to group 0, odd ones to group 1.
+        let ids: Vec<u32> = (0..16).map(|i| i % 2).collect();
+        let sg = SliceGroup::ExplicitAssignment {
+            num_slice_groups_minus1: 1,
+            slice_group_id: ids,
+        };
+        let map0 = SliceGroupMap::for_picture(&s, Some(&sg), None).unwrap();
+        let map1 = map0.clone();
+
+        // A slice per group, starting at each group's first map unit.
+        let addrs0 = read_skip_addresses(map0, 0, 8);
+        let addrs1 = read_skip_addresses(map1, 1, 8);
+
+        assert_eq!(addrs0, vec![0, 2, 4, 6, 8, 10, 12, 14]);
+        assert_eq!(addrs1, vec![1, 3, 5, 7, 9, 11, 13, 15]);
+
+        // The two slices together must restore the full picture distribution.
+        let mut all = addrs0.clone();
+        all.extend(addrs1);
+        let mut sorted = all.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..16).collect::<Vec<_>>());
+        assert_eq!(all.len(), 16);
+    }
+
+    #[test]
+    fn dispersed_group_slices_partition_the_picture() {
+        let s = sps(8, 8);
+        let sg = SliceGroup::Dispersed {
+            num_slice_groups_minus1: 1,
+        };
+        let map = SliceGroupMap::for_picture(&s, Some(&sg), None).unwrap();
+        let len0 = map.group_len(0);
+        let len1 = map.group_len(1);
+        assert_eq!(len0 + len1, 64);
+        let first_of_group1 = map.addr_in_group(1, 0).unwrap();
+
+        let addrs0 =
+            read_skip_addresses(map.clone(), map.addr_in_group(0, 0).unwrap(), len0 as u32);
+        let addrs1 = read_skip_addresses(map, first_of_group1, len1 as u32);
+
+        assert_eq!(addrs0.len(), len0);
+        assert_eq!(addrs1.len(), len1);
+        // No overlap, and full coverage.
+        let mut all = addrs0;
+        all.extend(addrs1);
+        assert_eq!(all.len(), 64);
+        let mut sorted = all;
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..64).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn changing_group_map_is_rebuilt_per_picture() {
+        let s = sps(4, 4);
+        let sg = SliceGroup::Changing {
+            change_type: crate::nal::pps::SliceGroupChangeType::RasterScan,
+            num_slice_groups_minus1: 1,
+            slice_group_change_direction_flag: false,
+            slice_group_change_rate_minus1: 3, // rate 4
+        };
+        // Picture 1: group 1 holds the first four raster units; picture 2 the first eight.
+        let map_pic1 = SliceGroupMap::for_picture(&s, Some(&sg), Some(1)).unwrap();
+        let map_pic2 = SliceGroupMap::for_picture(&s, Some(&sg), Some(2)).unwrap();
+        assert_eq!(map_pic1.group_len(1), 4);
+        assert_eq!(map_pic2.group_len(1), 8);
+
+        // The group-1 slice of picture 2 must visit units 0..=7 in order.
+        let addrs = read_skip_addresses(map_pic2.clone(), 0, 8);
+        assert_eq!(addrs, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+        // And group 0 covers the remaining units.
+        let first_g0 = map_pic2.addr_in_group(0, 0).unwrap();
+        let addrs_g0 = read_skip_addresses(map_pic2, first_g0, 8);
+        assert_eq!(addrs_g0, vec![8, 9, 10, 11, 12, 13, 14, 15]);
+    }
+
+    #[test]
+    fn first_mb_outside_picture_is_error() {
+        let s = sps(2, 2);
+        let map = SliceGroupMap::for_picture(&s, None, None).unwrap();
+        let rbsp = skip_run_rbsp(1);
+        let mut nal = vec![0u8];
+        nal.extend_from_slice(&rbsp);
+        let mut reader = BitReader::new(crate::rbsp::ByteReader::skipping_h264_header(
+            Cursor::new(nal),
+        ));
+        let err = match SliceDataReader::with_group_map(&mut reader, SliceFamily::P, 16, map, 0) {
+            Ok(_) => panic!("expected an error for an out-of-picture first_mb_in_slice"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, SliceDataError::InvalidFirstMbInSlice(16)));
+    }
+
+    #[test]
+    fn interleaved_group_slices_partition_picture() {
+        let s = sps(4, 4);
+        // Runs of 4: group 0 = units 0..4 and 8..12, group 1 = the rest.
+        let sg = SliceGroup::Interleaved {
+            run_length_minus1: vec![3, 3],
+        };
+        let map = SliceGroupMap::for_picture(&s, Some(&sg), None).unwrap();
+        let len0 = map.group_len(0) as u32;
+        let len1 = map.group_len(1) as u32;
+        let addrs0 = read_skip_addresses(map.clone(), 0, len0);
+        let first_g1 = map.addr_in_group(1, 0).unwrap();
+        let addrs1 = read_skip_addresses(map, first_g1, len1);
+        let mut all = addrs0;
+        all.extend(addrs1);
+        assert_eq!(all.len(), 16);
+        let mut sorted = all;
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..16).collect::<Vec<_>>());
     }
 }

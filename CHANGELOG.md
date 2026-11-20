@@ -18,6 +18,15 @@
 ### Added
 
 *   Baseline-profile support for parsing `slice_data()` syntax.
+*   Slice group (FMO) addressing for `slice_data()`: a new `slice::fmo::SliceGroupMap` builds
+    the per-picture macroblock-to-slice-group assignment declared by the PPS for all six
+    `slice_group_map_type` values (interleaved, dispersed, foreground/leftover, box-out,
+    raster-scan, wipe-out and explicit assignment). `SliceDataReader::with_group_map()` walks
+    the map units of one slice group in their actual picture positions, so the macroblocks of
+    every slice in a picture together restore the full macroblock distribution. Map types
+    3–5 are rebuilt per picture from `slice_group_change_cycle`, and declarations that cannot
+    be interpreted for the picture geometry return a `SliceGroupMapError`. Single-slice-group
+    streams keep using `SliceDataReader::new()` and plain raster order.
 *   Derive `Clone` and `Copy` for `SliceFamily`.
 *   Add scaling list helper methods that convert stored `next_scale` intermediates into final
     `ScalingList` values:
