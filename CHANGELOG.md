@@ -43,6 +43,13 @@
 *   RBSP writing—`BitWrite` and `BitWriter` to encode RBSP streams, `ByteWriter` to add emulation
     prevention bytes.
 *   Write `SeqParameterSet` to an RBSP stream.
+*   Add `renumber::ParamSetRenumberer` for re-numbering H.264 parameter set ids across a whole
+    bitstream.  Caller-supplied sparse mappings rewrite the `seq_parameter_set_id` /
+    `pic_parameter_set_id` fields in SPS (types 7/15/13), PPS (type 8, including its referenced
+    SPS id), and the `pic_parameter_set_id` references in slice headers (types 1–5, 19–21,
+    including the 4-byte MVC/SVC header extension).  Self-inconsistent mappings (two coexisting
+    parameter sets mapping to the same new id) are rejected before any output; an identity
+    mapping reproduces the input byte for byte.
 *   A new `PpsError::InvalidPicSizeInMapUnitsMinus1` variant
 
 ### Fixed
