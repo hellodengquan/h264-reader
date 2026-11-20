@@ -13,10 +13,12 @@
     match its conventions.
 *   BREAKING CHANGE: `Profile::from_profile_idc()` now accepts `ConstraintFlags` to distinguish constrained/intra profile variants. Add `Profile` enum variants: `ConstrainedBaseline`, `ProgressiveHigh`, `ConstrainedHigh`, `High10Intra`, `High422Intra`, `High444Intra`, `ScalableConstrainedBaseline`, `ScalableConstrainedHigh`, `ScalableHighIntra`.
 *   BREAKING CHANGE: `SliceHeader::from_bits()` now takes an additional `header_extension: Option<&NalHeaderExtension>` parameter. Pass `None` for standard AVC NAL types (1/5). For MVC NAL types (20/21), pass the parsed extension to enable correct `idr_pic_flag` derivation and MVC ref pic list modification parsing.
+*   BREAKING CHANGE: `SliceHeader` now has a `nal_ref_idc` field, copied from the NAL unit header, needed by the picture order count derivation for type 1.
 *   Update minimum supported Rust version from 1.81 to 1.83.
 
 ### Added
 
+*   Picture order count derivation (spec 8.2.1) via the new `nal::slice::poc` module. `poc::PicOrderCounter::record_picture()` tracks the spec's cross-picture state and returns absolute top/bottom field order counts for all three `pic_order_cnt_type` modes, for both frame- and field-coded pictures. An IDR picture (or MMCO operation 5) establishes the derivation origin; feeding a stream segment starting at any IDR produces the same order counts as the full stream. Explicit errors are returned when no origin exists yet or when the SPS order-count parameters change incompatibly.
 *   Baseline-profile support for parsing `slice_data()` syntax.
 *   Derive `Clone` and `Copy` for `SliceFamily`.
 *   Add scaling list helper methods that convert stored `next_scale` intermediates into final

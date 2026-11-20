@@ -1,6 +1,7 @@
 mod cavlc;
 pub mod data;
 pub mod macroblock;
+pub mod poc;
 
 use crate::nal::pps;
 use crate::nal::pps::{PicParamSetId, PicParameterSet};
@@ -478,6 +479,9 @@ pub struct SliceHeader {
     pub slice_type: SliceType,
     pub colour_plane: Option<ColourPlane>,
     pub frame_num: u16,
+    /// Value of `nal_ref_idc` from the NAL unit header (zero means the picture
+    /// is not used as a reference).
+    pub nal_ref_idc: u8,
     pub field_pic: FieldPic,
     pub idr_pic_id: Option<u32>,
     pub pic_order_cnt_lsb: Option<PicOrderCountLsb>,
@@ -740,6 +744,7 @@ impl SliceHeader {
             slice_type,
             colour_plane,
             frame_num,
+            nal_ref_idc: header.nal_ref_idc(),
             field_pic,
             idr_pic_id,
             pic_order_cnt_lsb,
