@@ -1,5 +1,7 @@
 //! Push parsing of encoded NALs.
 
+pub mod access_unit;
+
 use crate::nal::{NalHeader, RefNal};
 
 /// [`AccumulatedNalHandler`]'s interest in receiving additional callbacks on a NAL.

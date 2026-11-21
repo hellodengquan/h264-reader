@@ -68,6 +68,43 @@ The following list shows the current state of support per H264 syntax element:
    * [ ] `depth_parameter_set_rbsp()`
    * [x] `slice_layer_extension_rbsp()` — MVC `slice_header()` only (including `ref_pic_list_mvc_modification()`), not `slice_data()`
 
+## Access unit grouping
+
+Muxing an H.264 elementary stream into MP4 samples, or timing/dropping whole images, needs NAL
+units grouped into _access units_ — all the slices of one picture together with the parameter
+sets, SEI and other non-VCL NAL units that the standard requires to appear with it.
+
+`h264_reader::push::access_unit::AccessUnitGrouper` sits on top of the normal push parser and
+delivers whole access units through the `AccessUnitHandler` trait.  It applies the "first VCL
+NAL unit of a primary coded picture" rules of H.264 section 7.4.1.2.3, holds back non-VCL NAL
+units that precede a picture until the picture they belong to is known, and only ever examines
+complete NAL units — so the grouping is identical regardless of how the input bytes are chunked.
+NAL units that cannot be parsed are reported via `AccessUnitHandler::unparseable` without
+disturbing the grouping of the NAL units that follow.
+
+```rust
+use h264_reader::annexb::AnnexBReader;
+use h264_reader::nal::{Nal, RefNal, UnitType};
+use h264_reader::push::access_unit::{AccessUnitGrouper, AccessUnitHandler};
+
+#[derive(Default)]
+struct Counter { samples: Vec<Vec<UnitType>> }
+impl AccessUnitHandler for Counter {
+    fn start(&mut self) { self.samples.push(Vec::new()); }
+    fn nal(&mut self, nal: RefNal<'_>) {
+        self.samples.last_mut().unwrap().push(nal.header().unwrap().nal_unit_type());
+    }
+}
+
+let mut reader = AnnexBReader::accumulate(AccessUnitGrouper::new(Counter::default()));
+// ... call reader.push(bytes) as data arrives ...
+reader.reset();                 // end the current Annex B NAL unit
+reader.nal_handler_mut().reset(); // flush the final access unit
+```
+
+The existing per-NAL push interface (`NalAccumulator` / `AccumulatedNalHandler`) is unchanged.
+See the `access_units` example for building length-prefixed MP4 sample bytes.
+
 ## Design goals
 
 ### Avoid copies

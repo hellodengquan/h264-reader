@@ -17,6 +17,14 @@
 
 ### Added
 
+*   Access unit grouping for push parsers. `push::access_unit::AccessUnitGrouper` implements the
+    H.264 section 7.4.1.2.3 "first VCL NAL unit of a primary coded picture" rules on top of the
+    existing per-NAL push interface, delivering whole access units through the new
+    `push::access_unit::AccessUnitHandler` trait. Non-VCL NAL units preceding a picture are held
+    back and attached to the correct access unit, grouping is independent of input chunking, the
+    final access unit is flushed via `reset()`, and unparseable NAL units are reported via
+    `AccessUnitHandler::unparseable` without disturbing subsequent grouping. The per-NAL
+    `AccumulatedNalHandler` contract is unchanged.
 *   Baseline-profile support for parsing `slice_data()` syntax.
 *   Derive `Clone` and `Copy` for `SliceFamily`.
 *   Add scaling list helper methods that convert stored `next_scale` intermediates into final
